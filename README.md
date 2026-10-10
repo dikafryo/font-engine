@@ -2,6 +2,12 @@
 
 font.sw4u.kr(`sw4u/font`) 의 폰트 엔진. 웹 서빙 대상 아님. 사이트와는 작업 폴더 규약으로만 연결된다(`sw4u/font/CLAUDE.md`).
 
+## 저장소 (GitHub, 비공개)
+- 엔진(여기): https://github.com/dikafryo/font-engine
+- 사이트: https://github.com/dikafryo/font
+- 원격은 SSH(`git@github.com:dikafryo/…`). `.venv/`·`out/`·`scans/` 는 올리지 않는다
+- 작업 폴더 규약(`job.json`·`status.json`)을 바꾸면 사이트·엔진 두 저장소에 각각 커밋·푸시한다
+
 ## 흐름
 1. `layout.py` — 양식 칸 좌표의 단일 출처 (A4, mm). 4쪽: 한글 175칸(2쪽), 영문·숫자·기호 81칸, 문장(분석용, 선택)
 2. `sheet.py` — 양식 PDF 생성. 모서리 5mm 마커 4개 + 아래 가운데 쪽 코드 8비트 `[1, kind×3, page×3, 1]`
