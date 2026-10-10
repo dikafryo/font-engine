@@ -1,0 +1,177 @@
+"""스캔 파일들 → 폰트. worker.py 가 작업마다 호출한다."""
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from statistics import median
+
+from PIL import Image, ImageDraw, ImageFont
+
+from . import layout as L
+from .compose import TYPES, Composer, Library
+from .fontbuild import GlyphSrc, Metrics, build, to_woff2
+from .hangul import CHO, JONG, JUNG, all_syllables, decompose, segment
+from .scan import PX_PER_MM, PageImage, ScanError, align, extract_cells, load_images
+from .vector import Bounds, Outline, bounds, fit, trace
+
+Progress = Callable[[str, int], None]
+REQUIRED_PAGES = (1, 2)
+INSET_MM = 0.7  # scan.extract_cells 와 같은 값
+COMPAT_CONS = "ㄱㄲㄳㄴㄵㄶㄷㄸㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅃㅄㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+PREVIEW_LINES = ("다람쥐 헌 쳇바퀴에 타고파", "내 손글씨로 만든 폰트입니다.", "ABC abc 0123456789 !?")
+
+
+class PipelineError(Exception):
+    def __init__(self, code: str, message: str, details: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or []
+
+
+@dataclass
+class Report:
+    pages: list[int] = field(default_factory=list)
+    file_errors: list[str] = field(default_factory=list)
+    direct: int = 0
+    composed: int = 0
+    latin: int = 0
+    not_made: int = 0
+    empty_cells: list[dict] = field(default_factory=list)  # {char, page, index, kind}
+    unsplit: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+def read_pages(inputs: list[Path], report: Report) -> dict[int, PageImage]:
+    pages: dict[int, PageImage] = {}
+    for path in inputs:
+        try:
+            images = load_images(path)
+        except (ScanError, RuntimeError) as e:
+            report.file_errors.append(f"{path.name}: {e}")
+            continue
+        for i, img in enumerate(images, 1):
+            label = path.name if len(images) == 1 else f"{path.name} {i}쪽"
+            try:
+                page = align(img, label)
+            except ScanError as e:
+                report.file_errors.append(f"{label}: {e}")
+                continue
+            pages[page.number] = page
+    report.pages = sorted(pages)
+    missing = [p for p in REQUIRED_PAGES if p not in pages]
+    if missing:
+        names = ", ".join(f"{p}쪽" for p in missing)
+        raise PipelineError("missing_pages", f"양식 {names}을 찾지 못했습니다", report.file_errors)
+    return pages
+
+
+def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress, names: dict[str, str] | None = None) -> Report:
+    report = Report()
+    progress("scan", 5)
+    pages = read_pages(inputs, report)
+
+    progress("recognize", 20)
+    cell_px = int((L.BOX - 2 * INSET_MM) * PX_PER_MM)
+    lib = Library(cell_px)
+    direct: dict[str, Outline] = {}
+    latin: dict[str, Outline] = {}
+    cells = [c for n in sorted(pages) for c in extract_cells(pages[n])]
+    for i, ink in enumerate(cells):
+        if i % 20 == 0:
+            progress("recognize", 20 + 30 * i // len(cells))
+        if ink.empty:
+            report.empty_cells.append({"char": ink.cell.char, "page": ink.cell.page, "index": ink.cell.index, "kind": ink.cell.kind})
+            continue
+        outline = trace(ink.mask)
+        if ink.cell.kind == "latin":
+            latin[ink.cell.char] = outline
+            continue
+        direct[ink.cell.char] = outline
+        syl = decompose(ink.cell.char)
+        parts = segment(ink.mask, syl)
+        if parts:
+            lib.add(syl, parts)
+        else:
+            report.unsplit.append(ink.cell.char)
+    if len(direct) < 40:
+        raise PipelineError("too_few", f"인식된 한글이 {len(direct)}자뿐입니다. 글씨가 너무 흐리거나 칸 밖에 쓰지 않았는지 확인해 주세요")
+
+    progress("compose", 55)
+    composer = Composer(lib)
+    glyphs = [GlyphSrc(ch, o, "hangul") for ch, o in direct.items()]
+    for ch in all_syllables():
+        if ch in direct:
+            continue
+        outline = composer.compose(decompose(ch))
+        if outline:
+            glyphs.append(GlyphSrc(ch, outline, "hangul"))
+            report.composed += 1
+        else:
+            report.not_made += 1
+    glyphs += compat_jamo(lib, cell_px)
+    glyphs += [GlyphSrc(ch, o, "latin") for ch, o in latin.items()]
+    report.direct, report.latin = len(direct), len(latin)
+
+    progress("build", 85)
+    metrics = make_metrics(list(direct.values()), cell_px)
+    otf = build(glyphs, metrics, family, uid, out / "font.otf", names)
+    to_woff2(otf, out / "font.woff2")
+    preview(otf, out / "preview.png")
+    progress("build", 100)
+    return report
+
+
+def make_metrics(hangul: list[Outline], cell_px: int) -> Metrics:
+    bs = [b for b in map(bounds, hangul) if b]
+    scale = 800 / median(b.h for b in bs)
+    adv = round(min(1100, max(820, median(b.w for b in bs) * scale + 150)))
+    baseline = (L.BOX * L.LATIN_BASELINE - INSET_MM) * PX_PER_MM
+    return Metrics(cell_px, baseline, scale, adv)
+
+
+def compat_jamo(lib: Library, cell_px: int) -> list[GlyphSrc]:
+    """호환 자모 ㄱ~ㅣ (ㅋㅋ, ㅠㅠ 용). 부품을 칸 가운데에 키워 놓는다."""
+    out = []
+    for i, ch in enumerate(COMPAT_CONS):
+        keys = []
+        if ch in CHO:
+            keys.append(("cho", CHO.index(ch)))
+        if ch in JONG:
+            keys.append(("jong", JONG.index(ch)))
+        outline = _first_part(lib, keys)
+        if outline:
+            out.append(GlyphSrc(chr(0x3131 + i), _center(outline, cell_px, 0.62), "hangul"))
+    for i in range(len(JUNG)):
+        outline = _first_part(lib, [("jung", i)])
+        if outline:
+            out.append(GlyphSrc(chr(0x314F + i), _center(outline, cell_px, 0.8), "hangul"))
+    return out
+
+
+def _first_part(lib: Library, keys: list[tuple[str, int]]) -> Outline | None:
+    for role, jamo in keys:
+        for t in TYPES:
+            found = lib.parts.get((role, jamo, t))
+            if found:
+                return found[0].outline
+    return None
+
+
+def _center(outline: Outline, cell: int, height: float) -> Outline:
+    b = bounds(outline)
+    k = min(height * cell / max(b.h, 1), 0.8 * cell / max(b.w, 1))
+    w, h = b.w * k, b.h * k
+    x0, y0 = (cell - w) / 2, (cell - h) / 2
+    return fit(outline, b, Bounds(x0, y0, x0 + w, y0 + h))
+
+
+def preview(otf: Path, out: Path) -> None:
+    font = ImageFont.truetype(str(otf), 64)
+    img = Image.new("RGB", (1400, 110 * len(PREVIEW_LINES) + 40), "white")
+    d = ImageDraw.Draw(img)
+    for i, line in enumerate(PREVIEW_LINES):
+        d.text((40, 30 + i * 110), line, font=font, fill=(20, 20, 30))
+    img.save(out)

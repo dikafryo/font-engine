@@ -1,0 +1,6 @@
+.venv/
+out/
+scans/
+__pycache__/
+*.bak.*
+*.sync-conflict-*
