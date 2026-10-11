@@ -8,6 +8,7 @@
   <jobs>/<id>/input/…      사이트가 씀  업로드 원본
   <jobs>/<id>/status.json  워커가 씀    {"state": queued|processing|done|failed, "step", "progress", "code",
                                          "message", "details", "report", "updated_at"}
+  <jobs>/<id>/glyphs/XXXX.png  사이트가 씀  편집한 글자 (job.json "glyphs": {글자: 상대경로}) — 스캔보다 우선
   <jobs>/<id>/font.otf · font.woff2 · preview.png   워커가 씀 (완료 시)
 """
 from __future__ import annotations
@@ -91,6 +92,18 @@ def inputs_of(d: Path, job: dict) -> list[Path]:
     return [f for f in files if f.is_file() and f.is_relative_to(base)]
 
 
+def glyphs_of(d: Path, job: dict) -> dict[str, Path]:
+    """job.json glyphs: {글자: "glyphs/XXXX.png"} — 작업 폴더 안의 파일만"""
+    base = d.resolve()
+    out = {}
+    for ch, rel in (job.get("glyphs") or {}).items():
+        if isinstance(ch, str) and len(ch) == 1 and isinstance(rel, str):
+            p = (d / rel).resolve()
+            if p.is_file() and p.is_relative_to(base):
+                out[ch] = p
+    return out
+
+
 def process(d: Path, job: dict) -> None:
     status_path = d / "status.json"
     write_json(status_path, {"state": "processing", "step": "scan", "progress": 0, "updated_at": now()})
@@ -106,7 +119,7 @@ def process(d: Path, job: dict) -> None:
     started = time.monotonic()
     try:
         names = {k: str(job[k]) for k in ("copyright", "license_text", "license_url") if isinstance(job.get(k), str) and job[k]}
-        report = run(inputs_of(d, job), name, d.name, d, progress, names)
+        report = run(inputs_of(d, job), name, d.name, d, progress, names, glyphs_of(d, job))
     except PipelineError as e:
         write_json(status_path, {"state": "failed", "code": e.code, "message": str(e), "details": e.details[:20], "updated_at": now()})
         log.info("실패 %s: %s", d.name, e)

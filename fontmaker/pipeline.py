@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from . import layout as L
@@ -39,6 +40,7 @@ class Report:
     composed: int = 0
     latin: int = 0
     not_made: int = 0
+    edited: int = 0  # 글자 편집(그림판·한 글자 사진)으로 덮어쓴 글자 수
     empty_cells: list[dict] = field(default_factory=list)  # {char, page, index, kind}
     unsplit: list[str] = field(default_factory=list)
 
@@ -70,7 +72,9 @@ def read_pages(inputs: list[Path], report: Report) -> list[PageImage]:
     return pages
 
 
-def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress, names: dict[str, str] | None = None) -> Report:
+def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress, names: dict[str, str] | None = None,
+        glyphs: dict[str, Path] | None = None) -> Report:
+    """glyphs: 글자 → 편집한 글자 PNG(검은 획·흰 바탕, 정사각 칸). 스캔에서 읽은 같은 글자를 덮어쓴다."""
     report = Report()
     progress("scan", 5)
     pages = read_pages(inputs, report)
@@ -100,6 +104,22 @@ def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress
         if parts:
             lib.add(syl, parts)  # 같은 글자의 여러 샘플은 모두 부품 후보 (평소 버릇의 중앙값이 안정된다)
             split_ok.add(ink.cell.char)
+    for ch, path in (glyphs or {}).items():  # 편집한 글자: 스캔보다 우선. 한글이면 부품 후보로도 넣는다
+        mask = load_glyph(path, cell_px)
+        if mask is None:
+            continue
+        outline = trace(mask)
+        syl = decompose(ch)
+        if syl is None:
+            latin[ch] = outline
+        else:
+            direct[ch] = outline
+            tried.add(ch)
+            parts = segment(mask, syl)
+            if parts:
+                lib.add(syl, parts)
+                split_ok.add(ch)
+        report.edited += 1
     report.unsplit = sorted(tried - split_ok)
     seen = set(direct) | set(latin)
     # 빈칸 알림은 본 양식만 (추가 양식은 쓴 만큼만 올려도 된다)
@@ -131,6 +151,19 @@ def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress
     preview(otf, out / "preview.png")
     progress("build", 100)
     return report
+
+
+def load_glyph(path: Path, cell_px: int) -> np.ndarray | None:
+    """편집한 글자 PNG → 칸 크기 bool 마스크(True=잉크). 투명 바탕은 흰색으로 깔고, 잉크가 거의 없으면 None."""
+    try:
+        img = Image.open(path).convert("RGBA")
+    except OSError:
+        return None
+    flat = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    flat.alpha_composite(img)
+    gray = flat.convert("L").resize((cell_px, cell_px), Image.LANCZOS)
+    mask = np.array(gray) < 128
+    return mask if mask.sum() >= PX_PER_MM ** 2 else None
 
 
 def make_metrics(hangul: list[Outline], cell_px: int) -> Metrics:

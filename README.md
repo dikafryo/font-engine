@@ -67,3 +67,7 @@ venv: reportlab, fonttools, brotli, opencv-python-headless, numpy, potracer, pym
 사이트가 `job.json` 에 `copyright`·`license_text`·`license_url` 을 넣어 주면 워커가 그대로 name 테이블
 ID 0(copyright)·13(licenseDescription)·14(licenseInfoURL)에 기록한다(`fontbuild.build(..., names)`). 없으면 기본 문구.
 문구의 기준은 사이트 `sw4u/font/src/License.php` 한 곳이며 엔진은 라이선스 종류를 모른다.
+
+## 글자 편집 덮어쓰기 (2026-10-11)
+job.json 의 `"glyphs": {"가": "glyphs/AC00.png"}` 가 있으면 `pipeline.run(..., glyphs=)` 이 그 PNG(흰 바탕·검은 획, 정사각)를 칸 크기로 줄여 마스크로 쓴다.
+스캔에서 읽은 같은 글자를 덮어쓰고, 한글이면 `segment` 로 부품도 뽑아 조합에 쓴다. `Report.edited` 로 센다. 사이트의 "글자 하나씩 고치기"가 만든다.
