@@ -13,7 +13,8 @@ import numpy as np
 from . import layout as L
 
 PX_PER_MM = 12.0
-INK_LEVEL = 0.58  # 배경 대비 밝기 비. 연파랑 안내선(~0.75)은 떨어지고 검정 펜(<0.4)은 남는다
+INK_LEVEL = 0.58  # 배경 대비 밝기 비. 연파랑 안내선(~0.75)은 떨어지고 검정 펜(<0.4)은 남는다. 흑백 인쇄 안내선(~0.6)은 drop_rules 가 지운다
+# (쪽마다 기준을 낮추는 방법은 가는 펜 획을 더 가늘게 만들어 실제 글씨 검증에서 나빴다: 0.295 → 0.259)
 MAX_SIDE = 4200  # 너무 큰 사진은 줄여서 처리
 
 
@@ -26,6 +27,7 @@ class PageImage:
     number: int
     norm: np.ndarray  # float32, 1.0=종이, 낮을수록 잉크
     source: str
+    kind: int = L.SHEET_KIND  # 양식 종류 (쪽 코드에서 읽음)
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,7 @@ def warp(norm: np.ndarray, quad: np.ndarray, rot: int) -> np.ndarray:
     return cv2.warpPerspective(norm, m, size, flags=cv2.INTER_LINEAR, borderValue=1.0)
 
 
-def read_code(page: np.ndarray) -> int | None:
+def read_code(page: np.ndarray) -> tuple[int, int] | None:
     bits = []
     inset = L.CODE_SQ * 0.25
     for x, y in L.code_squares():
@@ -115,27 +117,87 @@ def align(img: np.ndarray, source: str) -> PageImage:
     quad = find_marks(norm)
     for rot in range(4):
         page = warp(norm, quad, rot)
-        number = read_code(page)
-        if number is not None:
-            return PageImage(number, page, source)
+        code = read_code(page)
+        if code is not None:
+            return PageImage(code[1], page, source, code[0])
     raise ScanError("쪽 코드(아래 가운데 작은 네모)를 읽지 못했습니다 — font.sw4u.kr 양식이 맞는지 확인해 주세요")
 
 
 def extract_cells(page: PageImage) -> list[CellInk]:
-    spec = L.pages()[page.number - 1]
+    spec = L.pages(page.kind)[page.number - 1]
     inset = 0.7  # 칸 테두리 안쪽으로 (mm)
     size = int((L.BOX - 2 * inset) * PX_PER_MM)
     out = []
     for cell in spec.cells:
         x0, y0 = int((cell.x + inset) * PX_PER_MM), int((cell.y + inset) * PX_PER_MM)
-        mask = clean(page.norm[y0:y0 + size, x0:x0 + size] < INK_LEVEL)
-        out.append(CellInk(cell, mask, int(mask.sum()) < PX_PER_MM ** 2 * 1.5))
+        crop = page.norm[y0:y0 + size, x0:x0 + size]
+        mask = clean(drop_printed_lines((crop < INK_LEVEL) & ~guide_pixels(crop), cell.kind, inset))
+        least = 1.5 if cell.kind == "hangul" else 0.2  # mm². 문장부호(. ' -)는 잉크가 아주 적다
+        out.append(CellInk(cell, mask, int(mask.sum()) < PX_PER_MM ** 2 * least))
     return out
 
 
+def guide_pixels(crop: np.ndarray) -> np.ndarray:
+    """흑백 인쇄된 안내선 픽셀: 칸 폭(또는 높이)의 35% 넘게 회색인 행·열(±1)에서 펜보다 연한(>0.4) 픽셀.
+    안내선 위를 지나는 펜 획은 더 진해서 남는다."""
+    out = np.zeros(crop.shape, bool)
+    light = crop > 0.4
+    for axis in (1, 0):
+        lines = np.nonzero(np.percentile(crop, 35, axis=axis) < 0.85)[0]  # 점선(칸 폭의 ~40%)도 잡히게
+        for i in lines:
+            sl = slice(max(i - 1, 0), i + 2)
+            if axis == 1:
+                out[sl, :] |= light[sl, :]
+            else:
+                out[:, sl] |= light[:, sl]
+    return out
+
+
+def drop_printed_lines(mask: np.ndarray, kind: str, inset: float) -> np.ndarray:
+    """인쇄된 줄이 있을 자리(칸 가장자리 = 테두리, 영문 기준선)의 띠 안에서, 칸 폭 25% 넘게 이어지는 가늘고 긴 줄을 지운다.
+    스캔 앱 흑백 필터는 안내선을 펜만큼 진하게 만들고 종이가 휘면 줄이 물결쳐서, 밝기·행 단위로는 못 지운다."""
+    size = mask.shape[0]
+    band = int(1.6 * PX_PER_MM)
+    run = max(3, int(0.25 * size))
+    m = mask.astype(np.uint8)
+    rows = [(0, band), (size - band, size)]
+    if kind == "latin":
+        base = int((L.BOX * L.LATIN_BASELINE - inset) * PX_PER_MM)
+        rows.append((base - band, base + band))
+    out = mask.copy()
+    for horizontal, spans in ((True, rows), (False, [(0, band), (size - band, size)])):
+        kernel = np.ones((1, run) if horizontal else (run, 1), np.uint8)
+        line = cv2.dilate(cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel), np.ones((5, 1) if horizontal else (1, 5), np.uint8)) > 0
+        for lo, hi in spans:
+            if horizontal:
+                out[lo:hi, :] &= ~line[lo:hi, :]
+            else:
+                out[:, lo:hi] &= ~line[:, lo:hi]
+    # 물결친 줄이 끊겨 남은 짧은 조각: 띠 안에 다 들어 있고 납작하게 긴 작은 덩어리 (마침표처럼 둥근 점은 남긴다)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), connectivity=8)
+    thin = int(0.6 * PX_PER_MM)
+    for i in range(1, n):
+        x, y, w, h, _ = stats[i]
+        flat = h <= thin and w >= 2 * h
+        tall = w <= thin and h >= 2 * w
+        in_row = any(lo <= y and y + h <= hi for lo, hi in rows)
+        in_col = x + w <= band or x >= size - band
+        if (flat and in_row) or (tall and in_col):
+            out[labels == i] = False
+    return out
+
+
+def drop_rules(mask: np.ndarray) -> np.ndarray:
+    """칸 폭을 거의 꽉 채우는 얇은 가로·세로 줄(흑백 인쇄된 안내선·칸 테두리)을 지운다. 손글씨 획은 칸을 85% 넘게 채우지 않는다."""
+    m = mask.copy()
+    m[m.mean(1) > 0.85, :] = False
+    m[:, m.mean(0) > 0.85] = False
+    return m
+
+
 def clean(mask: np.ndarray) -> np.ndarray:
-    """작은 티끌 제거 + 획 가장자리 정리."""
-    m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    """안내선 제거 + 작은 티끌 제거 + 획 가장자리 정리."""
+    m = cv2.morphologyEx(drop_rules(mask).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     keep = np.zeros(n, bool)
     keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= PX_PER_MM ** 2 * 0.12

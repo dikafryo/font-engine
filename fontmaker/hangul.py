@@ -1,7 +1,8 @@
 """한글 음절 ↔ 자모, 손글씨 음절을 초·중·종성 부품으로 나누기.
 
-부품 분리는 연결요소(획 덩어리) 단위로 위치 규칙에 따라 배정한다. 자모끼리 붙여 쓴 글자는
-분리에 실패할 수 있고, 그 글자는 통째로만 쓰고 부품 공급원에서는 빠진다.
+부품 분리는 여러 후보(획 덩어리 규칙 배정·기준 상자 배정·붙은 곳 자르기·픽셀 가르기)를 만들고
+기준 배치(reference.py, Noto Sans KR Thin)와 가장 닮은 것을 고른다. 끝내 못 나눈 글자는 통째로만 쓰고
+부품 공급원에서는 빠진다.
 """
 from __future__ import annotations
 
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+from . import reference
 
 CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
 JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
@@ -202,20 +205,138 @@ def split_mixed(comps: list[Comp], ink: Box, syl: Syllable) -> dict[str, list[Co
 
 
 SPLITTERS = {"V": split_vertical, "H": split_horizontal, "M": split_mixed}
+CUT_COST = 0.04  # 자른 곳 하나당 점수 깎기 (덜 자른 후보 우선)
+PIXEL_COST = 0.08  # 기준 상자로 픽셀을 가르는 최후 수단의 점수 깎기
+MIN_SCORE = 0.3  # 이보다 기준 배치와 안 닮으면 분리 실패로 본다
 
 
 def segment(mask: np.ndarray, syl: Syllable) -> dict[str, np.ndarray] | None:
-    """음절 비트맵 → {"cho","jung","jong"} 부품 마스크. 규칙이 안 맞으면 붙은 곳을 잘라 다시 시도, 끝내 안 되면 None."""
-    for cut in _cut_variants(mask, syl):
-        parts = _assign(cut, syl)
-        if parts is not None:
-            return parts
-    return None
+    """음절 비트맵 → {"cho","jung","jong"} 부품 마스크. 끝내 못 나누면 None.
+
+    후보: (원본 + 붙은 곳을 1~3군데 자른 변형) × (모음 방향 규칙 분리, 기준 상자 겹침 배정) + 기준 상자로 픽셀 가르기.
+    그중 역할별 상자가 기준 배치(reference, 같은 음절의 Noto Thin 배치)와 가장 닮은 후보를 고른다.
+    """
+    ref = _ref_boxes(syl)
+    best, best_score = None, MIN_SCORE
+    for cut, n_cuts in _cut_variants(mask, syl):
+        comps = components(cut)
+        if len(comps) < 2:
+            continue
+        ink = bbox(comps)
+        for parts in (SPLITTERS[syl.vclass](comps, ink, syl), _by_boxes(comps, ink, ref, syl)):
+            if parts is None or not _complete(parts, syl) or not _plausible(parts, syl):
+                continue
+            masks = _union(parts, mask.shape)
+            score = _score(masks, ref) - CUT_COST * n_cuts
+            if score > best_score:
+                best, best_score = masks, score
+    pixel = _by_pixels(mask, ref, syl)
+    if pixel is not None and _score(pixel, ref) - PIXEL_COST > best_score:
+        best = pixel
+    return best
+
+
+def _ref_boxes(syl: Syllable) -> dict[str, np.ndarray]:
+    """기준 배치의 역할 상자를 잉크 전체 상자 기준 0~1 로."""
+    boxes = {r: b for r in ROLES if (b := reference.box(syl.char, r)) is not None}
+    allb = np.array(list(boxes.values()))
+    x0, y0 = allb[:, :2].min(0)
+    x1, y1 = allb[:, 2:].max(0)
+    scale = np.array([x1 - x0, y1 - y0, x1 - x0, y1 - y0])
+    return {r: (b - [x0, y0, x0, y0]) / scale for r, b in boxes.items()}
+
+
+def _norm_box(mask: np.ndarray, ink: Box) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    return np.array([(xs.min() - ink.x0) / ink.w, (ys.min() - ink.y0) / ink.h,
+                     (xs.max() + 1 - ink.x0) / ink.w, (ys.max() + 1 - ink.y0) / ink.h])
+
+
+def _iou(a: np.ndarray, b: np.ndarray, pad: float = 0.06) -> float:
+    """상자 IoU. 둘 다 획 굵기쯤(pad, 잉크 상자 비율) 넓혀서 견준다 — ㅡ 처럼 얇은 상자가 굵기 차이만으로 0 이 되지 않게."""
+    a = a + [-pad, -pad, pad, pad]
+    b = b + [-pad, -pad, pad, pad]
+    iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = iw * ih
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _score(masks: dict[str, np.ndarray], ref: dict[str, np.ndarray]) -> float:
+    """역할 상자와 기준 상자의 IoU 평균 (잉크 전체 상자 기준으로 맞춘 뒤)."""
+    allm = np.zeros_like(next(iter(masks.values())))
+    for m in masks.values():
+        allm |= m
+    ys, xs = np.nonzero(allm)
+    ink = Box(xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+    return float(np.mean([_iou(_norm_box(masks[r], ink), ref[r]) for r in ref]))
+
+
+def _complete(parts: dict[str, list[Comp]], syl: Syllable) -> bool:
+    return bool(parts["cho"]) and bool(parts["jung"]) and bool(syl.jong) == bool(parts["jong"])
+
+
+def _union(parts: dict[str, list[Comp]], shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    out = {}
+    for role, cs in parts.items():
+        if cs:
+            m = np.zeros(shape, dtype=bool)
+            for c in cs:
+                m |= c.mask
+            out[role] = m
+    return out
+
+
+def _to_ink(ref: dict[str, np.ndarray], ink: Box) -> dict[str, np.ndarray]:
+    return {r: b * [ink.w, ink.h, ink.w, ink.h] + [ink.x0, ink.y0, ink.x0, ink.y0] for r, b in ref.items()}
+
+
+def _role_cost(shape: tuple[int, int], boxes: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """픽셀마다 역할 비용: 상자 밖이면 떨어진 거리, 안이면 상자 넓이(작은 상자 우선 — 큰 모음 상자가 초성을 삼키지 않게)."""
+    ys, xs = np.mgrid[0:shape[0], 0:shape[1]] + 0.5
+    out = {}
+    for r, b in boxes.items():
+        gap = np.maximum.reduce([b[0] - xs, xs - b[2], b[1] - ys, ys - b[3], np.zeros(shape)])
+        out[r] = gap * 50 + (b[2] - b[0]) * (b[3] - b[1]) / 100
+    return out
+
+
+def _by_boxes(comps: list[Comp], ink: Box, ref: dict[str, np.ndarray], syl: Syllable) -> dict[str, list[Comp]] | None:
+    """획 덩어리마다 비용이 가장 낮은 역할 (덩어리 픽셀 합)."""
+    cost = _role_cost(comps[0].mask.shape, _to_ink(ref, ink))
+    parts: dict[str, list[Comp]] = {r: [] for r in ROLES}
+    for c in comps:
+        parts[min(cost, key=lambda r: cost[r][c.mask].sum())].append(c)
+    return parts
+
+
+def _by_pixels(mask: np.ndarray, ref: dict[str, np.ndarray], syl: Syllable) -> dict[str, np.ndarray] | None:
+    """최후 수단: 픽셀을 기준 상자로 가른다. 몇 픽셀만 넘친 획 덩어리는 통째로 주된 역할에."""
+    comps = components(mask)
+    if not comps:
+        return None
+    ink = bbox(comps)
+    cost = _role_cost(mask.shape, _to_ink(ref, ink))
+    roles = list(cost)
+    near = np.argmin(np.stack([cost[r] for r in roles]), axis=0)
+    out = {r: np.zeros(mask.shape, bool) for r in roles}
+    for c in comps:
+        votes = np.bincount(near[c.mask], minlength=len(roles))
+        minority = votes.sum() - votes.max()
+        if minority <= 0.1 * votes.sum() and minority <= 0.02 * mask.sum():  # 가장자리 몇 픽셀만 넘친 덩어리
+            out[roles[int(votes.argmax())]] |= c.mask
+        else:
+            for k, r in enumerate(roles):
+                out[r] |= c.mask & (near == k)
+    if not all(out[r].sum() > 0.03 * mask.sum() for r in roles):
+        return None
+    return out
 
 
 def _cut_variants(mask: np.ndarray, syl: Syllable):
-    """원본 → 자모가 맞닿은 가장 가는 곳을 1~3군데 자른 변형들."""
-    yield mask
+    """(변형, 자른 곳 수): 원본 → 자모가 맞닿은 가장 가는 곳을 1~3군데 자른 변형들."""
+    yield mask, 0
     ys, xs = np.nonzero(mask)
     if len(ys) == 0:
         return
@@ -240,7 +361,7 @@ def _cut_variants(mask: np.ndarray, syl: Syllable):
                     m[max(at - 1, 0):at + 1, :] = False
                 else:
                     m[:, max(at - 1, 0):at + 1] = False
-            yield m
+            yield m, n
 
 
 def _argext(arr: np.ndarray, lo: float, hi: float, fn) -> int:
@@ -255,26 +376,6 @@ def _combos(items: list, n: int) -> list[list]:
     from itertools import combinations
 
     return [list(c) for c in combinations(items, n)]
-
-
-def _assign(mask: np.ndarray, syl: Syllable) -> dict[str, np.ndarray] | None:
-    comps = components(mask)
-    if len(comps) < 2:
-        return None
-    ink = bbox(comps)
-    parts = SPLITTERS[syl.vclass](comps, ink, syl)
-    if parts is None or not parts["cho"] or not parts["jung"] or bool(syl.jong) != bool(parts["jong"]):
-        return None
-    if not _plausible(parts, syl):
-        return None
-    out = {}
-    for role, cs in parts.items():
-        if cs:
-            m = np.zeros(mask.shape, dtype=bool)
-            for c in cs:
-                m |= c.mask
-            out[role] = m
-    return out
 
 
 def _plausible(parts: dict[str, list[Comp]], syl: Syllable) -> bool:

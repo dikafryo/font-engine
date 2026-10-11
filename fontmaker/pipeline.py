@@ -16,7 +16,7 @@ from .scan import PX_PER_MM, PageImage, ScanError, align, extract_cells, load_im
 from .vector import Bounds, Outline, bounds, fit, trace
 
 Progress = Callable[[str, int], None]
-REQUIRED_PAGES = (1, 2)
+REQUIRED_PAGES = L.REQUIRED_HANGUL_PAGES
 INSET_MM = 0.7  # scan.extract_cells 와 같은 값
 COMPAT_CONS = "ㄱㄲㄳㄴㄵㄶㄷㄸㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅃㅄㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
 PREVIEW_LINES = ("다람쥐 헌 쳇바퀴에 타고파", "내 손글씨로 만든 폰트입니다.", "ABC abc 0123456789 !?")
@@ -31,7 +31,9 @@ class PipelineError(Exception):
 
 @dataclass
 class Report:
-    pages: list[int] = field(default_factory=list)
+    pages: list[int] = field(default_factory=list)  # 본 양식에서 읽은 쪽
+    addon_pages: list[int] = field(default_factory=list)  # 추가 양식에서 읽은 쪽
+    samples: int = 0  # 직접 쓴 한글 칸 수 (같은 글자를 여러 번 썼으면 모두 센다)
     file_errors: list[str] = field(default_factory=list)
     direct: int = 0
     composed: int = 0
@@ -44,8 +46,9 @@ class Report:
         return dict(self.__dict__)
 
 
-def read_pages(inputs: list[Path], report: Report) -> dict[int, PageImage]:
-    pages: dict[int, PageImage] = {}
+def read_pages(inputs: list[Path], report: Report) -> list[PageImage]:
+    """올린 순서대로 모든 쪽. 같은 쪽을 여러 번 올렸으면(스캔 추가) 모두 돌려준다."""
+    pages: list[PageImage] = []
     for path in inputs:
         try:
             images = load_images(path)
@@ -55,13 +58,12 @@ def read_pages(inputs: list[Path], report: Report) -> dict[int, PageImage]:
         for i, img in enumerate(images, 1):
             label = path.name if len(images) == 1 else f"{path.name} {i}쪽"
             try:
-                page = align(img, label)
+                pages.append(align(img, label))
             except ScanError as e:
                 report.file_errors.append(f"{label}: {e}")
-                continue
-            pages[page.number] = page
-    report.pages = sorted(pages)
-    missing = [p for p in REQUIRED_PAGES if p not in pages]
+    report.pages = sorted({p.number for p in pages if p.kind == L.SHEET_KIND})
+    report.addon_pages = sorted({p.number for p in pages if p.kind == L.ADDON_KIND})
+    missing = [p for p in REQUIRED_PAGES if p not in report.pages]
     if missing:
         names = ", ".join(f"{p}쪽" for p in missing)
         raise PipelineError("missing_pages", f"양식 {names}을 찾지 못했습니다", report.file_errors)
@@ -78,24 +80,31 @@ def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress
     lib = Library(cell_px)
     direct: dict[str, Outline] = {}
     latin: dict[str, Outline] = {}
-    cells = [c for n in sorted(pages) for c in extract_cells(pages[n])]
-    for i, ink in enumerate(cells):
+    cells = [(page.kind, c) for page in pages for c in extract_cells(page)]
+    split_ok: set[str] = set()
+    tried: set[str] = set()
+    for i, (_, ink) in enumerate(cells):
         if i % 20 == 0:
             progress("recognize", 20 + 30 * i // len(cells))
         if ink.empty:
-            report.empty_cells.append({"char": ink.cell.char, "page": ink.cell.page, "index": ink.cell.index, "kind": ink.cell.kind})
             continue
         outline = trace(ink.mask)
         if ink.cell.kind == "latin":
-            latin[ink.cell.char] = outline
+            latin[ink.cell.char] = outline  # 여러 번 썼으면 나중에 올린 것
             continue
         direct[ink.cell.char] = outline
+        report.samples += 1
+        tried.add(ink.cell.char)
         syl = decompose(ink.cell.char)
         parts = segment(ink.mask, syl)
         if parts:
-            lib.add(syl, parts)
-        else:
-            report.unsplit.append(ink.cell.char)
+            lib.add(syl, parts)  # 같은 글자의 여러 샘플은 모두 부품 후보 (평소 버릇의 중앙값이 안정된다)
+            split_ok.add(ink.cell.char)
+    report.unsplit = sorted(tried - split_ok)
+    seen = set(direct) | set(latin)
+    # 빈칸 알림은 본 양식만 (추가 양식은 쓴 만큼만 올려도 된다)
+    blank = {ink.cell.char: ink.cell for kind, ink in cells if kind == L.SHEET_KIND and ink.empty and ink.cell.char not in seen}
+    report.empty_cells = [{"char": c.char, "page": c.page, "index": c.index, "kind": c.kind} for c in blank.values()]
     if len(direct) < 40:
         raise PipelineError("too_few", f"인식된 한글이 {len(direct)}자뿐입니다. 글씨가 너무 흐리거나 칸 밖에 쓰지 않았는지 확인해 주세요")
 

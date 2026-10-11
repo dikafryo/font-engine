@@ -1,24 +1,32 @@
 """직접 쓴 음절에서 뽑은 부품으로 나머지 음절을 조합한다.
 
-부품은 (역할, 자모, 위치유형) 별로 모은다. 같은 유형 부품이 있으면 그 자리 그대로 쓰고,
-없으면 다른 유형 부품을 '역할 평균 상자' 사이의 변환으로 옮겨 쓴다.
+부품은 (역할, 자모, 위치유형) 별로 모은다. 대상 음절의 자모 하나를 채울 때
+① 같은 자모 부품 중 기준 배치(reference)에서 원래 음절의 상자가 대상 음절의 상자와 가장 비슷한 것을 고르고,
+② 그 부품의 손글씨 상자에 '기준 글꼴에서 두 음절 사이 그 자모가 움직인 만큼'(변 단위, 손글씨 크기로 환산)을 더한 곳에 놓는다.
+쓴 사람의 버릇(크기·위치)은 살리고, 문맥(받침 유무·겹받침·모음 모양)에 따른 변화만 기준 글꼴을 따른다.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
 from statistics import median
+from math import log
 
 import numpy as np
 
-from .hangul import CHO, CHO_TO_JONG, JONG, JONG_TO_CHO, Syllable
-from .vector import Bounds, Outline, affine, bounds, fit, scale_about, trace
+from . import reference
+from .hangul import CHO, CHO_TO_JONG, JONG, JONG_TO_CHO, Syllable, decompose
+from .vector import Bounds, Outline, bounds, fit, trace
 
 TYPES = ("V0", "V1", "H0", "H1", "M0", "M1")
+SIBLING = 0.5  # 원래 음절이 대상과 다른 자모도 같으면 가산점 — 초성·중성 맞물림을 한 음절에서 함께 가져온다 (평가 +0.007)
+DENOISE = 0.5  # 부품을 놓을 때 그 샘플 한 번의 어긋남 대신 그 자모의 평소 버릇(후보들의 중앙값)을 섞는 비율
+# (실제 손글씨 교차 검증 IoU 0.294 → 0.313, 흔들림 합성 0.566 → 0.599)
+FOLLOW = 0.5  # 기준 글꼴의 문맥 이동을 얼마나 따를지 (1=그대로). 손글씨 6종 평가에서 0.5 가 1.0 보다 나았다
 PAIRS = {"ㄲ": "ㄱㄱ", "ㄸ": "ㄷㄷ", "ㅃ": "ㅂㅂ", "ㅆ": "ㅅㅅ", "ㅉ": "ㅈㅈ", "ㄳ": "ㄱㅅ", "ㄵ": "ㄴㅈ", "ㄶ": "ㄴㅎ",
          "ㄺ": "ㄹㄱ", "ㄻ": "ㄹㅁ", "ㄼ": "ㄹㅂ", "ㄽ": "ㄹㅅ", "ㄾ": "ㄹㅌ", "ㄿ": "ㄹㅍ", "ㅀ": "ㄹㅎ", "ㅄ": "ㅂㅅ"}
 
-# 손글씨 자료가 없을 때 쓰는 역할 상자 (칸 크기 대비 비율)
+# 역할별 대략의 자리 (칸 비율) — scripts/make_reference.py 가 기준 글꼴을 나눌 때 위치 사전확률로 쓴다
 DEFAULT_BOXES: dict[tuple[str, str], tuple[float, float, float, float]] = {
     ("cho", "V0"): (0.12, 0.22, 0.55, 0.78), ("jung", "V0"): (0.58, 0.10, 0.86, 0.90),
     ("cho", "V1"): (0.14, 0.12, 0.55, 0.50), ("jung", "V1"): (0.58, 0.06, 0.86, 0.62),
@@ -35,9 +43,10 @@ DEFAULT_BOXES: dict[tuple[str, str], tuple[float, float, float, float]] = {
 @dataclass(frozen=True)
 class Part:
     outline: Outline
-    box: Bounds
+    box: Bounds  # 손글씨 칸 픽셀 상자
     type: str
     source: str  # 부품을 뽑은 음절
+    role: str  # 원래 역할 (초성 자리 부품을 받침에 빌려 쓸 때 기준 상자를 찾는 데 쓴다)
 
 
 def mask_bounds(mask: np.ndarray) -> Bounds:
@@ -52,114 +61,125 @@ class Library:
 
     def add(self, syl: Syllable, masks: dict[str, np.ndarray]) -> None:
         for role, mask in masks.items():
-            part = Part(trace(mask), mask_bounds(mask), syl.type, syl.char)
+            part = Part(trace(mask), mask_bounds(mask), syl.type, syl.char, role)
             self.parts[(role, syl.jamo(role), syl.type)].append(part)
 
-    def role_boxes(self) -> dict[tuple[str, str], Bounds]:
-        """역할·유형별 평균(중앙값) 상자. 자료가 없으면 기본 비율."""
-        acc: dict[tuple[str, str], list[Bounds]] = defaultdict(list)
-        for (role, _, typ), parts in self.parts.items():
-            acc[(role, typ)] += [p.box for p in parts]
-        out = {}
-        for key, frac in DEFAULT_BOXES.items():
-            boxes = acc.get(key)
-            if boxes:
-                out[key] = Bounds(*(median(getattr(b, a) for b in boxes) for a in ("x0", "y0", "x1", "y1")))
-            else:
-                out[key] = Bounds(*(f * self.cell for f in frac))
-        return out
+    def of(self, role: str, jamo: int) -> list[Part]:
+        return [p for t in TYPES for p in self.parts.get((role, jamo, t), [])]
+
+    def scale(self) -> tuple[float, float]:
+        """기준 배치 1(칸 비율) = 손글씨 몇 픽셀인지 (가로, 세로). 부품 상자 크기 비의 중앙값."""
+        kx, ky = [], []
+        for parts in self.parts.values():
+            for p in parts:
+                b = reference.box(p.source, p.role)
+                kx.append(p.box.w / max(b[2] - b[0], 0.02))
+                ky.append(p.box.h / max(b[3] - b[1], 0.02))
+        return (median(kx), median(ky)) if kx else (self.cell, self.cell)
 
 
 class Composer:
     def __init__(self, lib: Library) -> None:
         self.lib = lib
-        self.boxes = lib.role_boxes()
-        self.gap = lib.cell * 0.025
+        self.kx, self.ky = lib.scale()
 
-    def _find(self, role: str, jamo: int, typ: str) -> tuple[Part, str] | None:
-        """(부품, 부품의 원래 역할). 같은 유형 → 같은 모음방향 → 받침 유무 같은 유형 → 아무 유형 순.
-        끝내 없으면 초성↔받침 같은 꼴 자음을 빌린다."""
-        order = sorted(TYPES, key=lambda t: (t != typ, t[0] != typ[0], t[1] != typ[1]))
-        for t in order:
-            found = self.lib.parts.get((role, jamo, t))
-            if found and (role, t) in self.boxes:
-                return found[0], role
+    def _candidates(self, role: str, jamo: int) -> list[Part]:
+        """같은 역할 부품, 없으면 초성↔받침 같은 꼴 자음."""
+        own = self.lib.of(role, jamo)
+        if own:
+            return own
         alt = {"cho": ("jong", CHO_TO_JONG), "jong": ("cho", JONG_TO_CHO)}.get(role)
         if alt and jamo in alt[1]:
-            other_role, table = alt
-            for t in order:
-                found = self.lib.parts.get((other_role, table[jamo], t))
-                if found and (other_role, t) in self.boxes:
-                    return found[0], other_role
-        return None
+            return self.lib.of(alt[0], alt[1][jamo])
+        return []
 
-    def _place(self, role: str, jamo: int, typ: str) -> Outline | None:
-        hit = self._find(role, jamo, typ)
-        if hit is None:
-            return self._place_pair(role, jamo, typ)
-        part, src_role = hit
-        if part.type == typ and src_role == role:
-            return part.outline
-        return fit(part.outline, self.boxes[(src_role, part.type)], self.boxes[(role, typ)])
+    @staticmethod
+    def _distance(a: np.ndarray, b: np.ndarray) -> float:
+        """기준 상자 둘이 얼마나 다른가 (크기 비 로그 + 중심 거리)."""
+        wa, ha, wb, hb = a[2] - a[0], a[3] - a[1], b[2] - b[0], b[3] - b[1]
+        size = abs(log(max(wa, 0.02) / max(wb, 0.02))) + abs(log(max(ha, 0.02) / max(hb, 0.02)))
+        move = abs((a[0] + a[2]) - (b[0] + b[2])) + abs((a[1] + a[3]) - (b[1] + b[3]))
+        return size + 2 * move
 
-    def _place_pair(self, role: str, jamo: int, typ: str) -> Outline | None:
-        """겹받침·쌍자음 샘플이 없으면 홑자음 둘을 상자 왼쪽·오른쪽에 나란히."""
+    def _place(self, role: str, jamo: int, target: str) -> Outline | None:
+        want = reference.box(target, role)
+        parts = self._candidates(role, jamo)
+        if not parts or want is None:
+            return self._place_pair(role, jamo, target, want)
+        goal = decompose(target)
+
+        def cost(p: Part) -> float:
+            src = decompose(p.source)
+            shared = sum(src.jamo(r) == goal.jamo(r) for r in ("cho", "jung", "jong") if r != role)
+            return self._distance(reference.box(p.source, p.role), want) - SIBLING * shared
+
+        part = min(parts, key=cost)
+        usual = np.median(np.array([self._residual(p) for p in parts]), axis=0)
+        offset = (1 - DENOISE) * self._residual(part) + DENOISE * usual
+        return fit(part.outline, part.box, self._moved(part.box, reference.box(part.source, part.role), want, offset))
+
+    def _to_ref(self, box: Bounds) -> np.ndarray:
+        ox, oy = self._origin()
+        return np.array([(box.x0 - ox) / self.kx, (box.y0 - oy) / self.ky, (box.x1 - ox) / self.kx, (box.y1 - oy) / self.ky])
+
+    def _residual(self, p: Part) -> np.ndarray:
+        """부품이 기준 상자에서 어긋난 정도 (기준 좌표, 4변) — 쓴 사람의 버릇 + 그 글자 한 번의 흔들림."""
+        return self._to_ref(p.box) - reference.box(p.source, p.role)
+
+    def _moved(self, box: Bounds, ref_from: np.ndarray, ref_to: np.ndarray, offset: np.ndarray | None = None) -> Bounds:
+        """손글씨 상자 box 를, 기준 상자 ref_from → ref_to 의 비례 변환으로 옮긴다 (기준 좌표에서 계산).
+        offset: 기준 상자에서의 어긋남(없으면 box 자신의 것). 쓴 사람의 버릇은 비율로 유지된다."""
+        goal = ref_from + FOLLOW * (ref_to - ref_from)
+        ox, oy = self._origin()
+        u = ref_from + (self._to_ref(box) - ref_from if offset is None else offset)
+        size_from = np.maximum(ref_from[2:] - ref_from[:2], 0.02)
+        k = np.clip((goal[2:] - goal[:2]) / size_from, 0.35, 3.0)  # 지나친 찌그러짐 방지
+        lo = goal[:2] + (u[:2] - ref_from[:2]) * k
+        hi = goal[:2] + (u[2:] - ref_from[:2]) * k
+        if (hi - lo).min() <= 0 and offset is not None:  # 평소 버릇을 섞었더니 뒤집히면 샘플 그대로
+            return self._moved(box, ref_from, ref_to)
+        return Bounds(ox + lo[0] * self.kx, oy + lo[1] * self.ky, ox + hi[0] * self.kx, oy + hi[1] * self.ky)
+
+    def _place_pair(self, role: str, jamo: int, target: str, want: np.ndarray | None) -> Outline | None:
+        """겹받침·쌍자음 샘플이 없으면 홑자음 둘을 대상 상자 왼쪽·오른쪽에 나란히."""
         names = CHO if role == "cho" else JONG
         pair = PAIRS.get(names[jamo])
-        if not pair:
+        if not pair or want is None:
             return None
-        dst = self.boxes[(role, typ)]
-        half = dst.w * 0.5
+        dst = self._absolute(want)
+        half = dst.w / 2
         out: Outline = []
         for i, single in enumerate(pair):
-            outline = self._place(role, names.index(single), typ)
-            src = bounds(outline) if outline else None
-            if src is None:
+            parts = self._candidates(role, names.index(single))
+            if not parts:
                 return None
+            aspect = half / max(dst.h, 1)
+            part = min(parts, key=lambda p: abs(log(max(p.box.w, 1) / max(p.box.h, 1) / aspect)))
             x0 = dst.x0 + i * half
-            out += fit(outline, src, Bounds(x0 + half * 0.04, dst.y0, x0 + half * 0.96, dst.y1))
+            out += fit(part.outline, part.box, Bounds(x0 + half * 0.04, dst.y0, x0 + half * 0.96, dst.y1))
         return out
 
+    def _absolute(self, ref_box: np.ndarray) -> Bounds:
+        """기준 상자 → 손글씨 칸 픽셀 (글자 전체 자리는 직접 쓴 글자들의 평균 자리에 맞춘다)."""
+        ox, oy = self._origin()
+        return Bounds(ox + ref_box[0] * self.kx, oy + ref_box[1] * self.ky, ox + ref_box[2] * self.kx, oy + ref_box[3] * self.ky)
+
+    def _origin(self) -> tuple[float, float]:
+        if not hasattr(self, "_org"):
+            xs, ys = [], []
+            for parts in self.lib.parts.values():
+                for p in parts:
+                    b = reference.box(p.source, p.role)
+                    xs.append(p.box.x0 - b[0] * self.kx)
+                    ys.append(p.box.y0 - b[1] * self.ky)
+            self._org = (median(xs), median(ys)) if xs else (0.0, 0.0)
+        return self._org
+
     def compose(self, syl: Syllable) -> Outline | None:
-        typ = syl.type
-        cho = self._place("cho", syl.cho, typ)
-        jung = self._place("jung", syl.jung, typ)
-        jong = self._place("jong", syl.jong, typ) if syl.jong else []
+        ch = syl.char
+        cho = self._place("cho", syl.cho, ch)
+        jung = self._place("jung", syl.jung, ch)
+        jong = self._place("jong", syl.jong, ch) if syl.jong else []
         if cho is None or jung is None or jong is None:
             return None
-        cho = self._avoid_overlap(cho, jung, syl)
-        if jong:
-            jong = self._push_down(jong, cho + jung)
         return cho + jung + jong
-
-    def _avoid_overlap(self, cho: Outline, jung: Outline, syl: Syllable) -> Outline:
-        cb, jb = bounds(cho), bounds(jung)
-        if cb is None or jb is None:
-            return cho
-        if syl.vclass == "V" and cb.x1 > jb.x0 - self.gap and cb.w > 0:
-            k = max(0.6, (jb.x0 - self.gap - cb.x0) / cb.w)
-            return scale_about(cho, k, 1.0, cb.x0, cb.y0)
-        if syl.vclass == "H" and cb.y1 > jb.y0 - self.gap and cb.h > 0:
-            k = max(0.6, (jb.y0 - self.gap - cb.y0) / cb.h)
-            return scale_about(cho, 1.0, k, cb.x0, cb.y0)
-        return cho
-
-    def _push_down(self, jong: Outline, above: Outline) -> Outline:
-        """받침이 윗부분과 겹치면 아래로 내리고, 칸을 넘으면 납작하게."""
-        jb, ab = bounds(jong), bounds(above)
-        if jb is None or ab is None:
-            return jong
-        top = ab.y1 + self.gap
-        if jb.y0 >= top:
-            return jong
-        room = self.lib.cell * 0.98 - top
-        if room <= jb.h * 0.5:
-            return jong
-        k = min(1.0, room / jb.h)
-        squeezed = scale_about(jong, 1.0, k, jb.x0, jb.y0)
-        return affine(squeezed, 1, 1, 0, top - jb.y0)
-
-
-def median_height(outlines: list[Outline]) -> float:
-    hs = [b.h for b in map(bounds, outlines) if b]
-    return median(hs) if hs else 1.0

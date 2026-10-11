@@ -3,7 +3,7 @@
 사용: python -m fontmaker.worker <jobs 폴더>
 
 작업 폴더 규약 (사이트 sw4u/font 와 공유):
-  <jobs>/<id>/job.json     사이트가 씀  {"id", "font_name", "created_at"(ISO8601 UTC), "files": ["input/1.jpg", …],
+  <jobs>/<id>/job.json     사이트가 씀  {"id", "font_name", "created_at"(ISO8601 UTC), "touched_at"(다시 만든 시각, 선택), "files": ["input/1.jpg", …],
                                          "copyright", "license_text", "license_url"(선택 — 폰트 name 테이블에 그대로 기록)}
   <jobs>/<id>/input/…      사이트가 씀  업로드 원본
   <jobs>/<id>/status.json  워커가 씀    {"state": queued|processing|done|failed, "step", "progress", "code",
@@ -55,11 +55,20 @@ def created(job: dict) -> datetime:
         return datetime.fromtimestamp(0, timezone.utc)
 
 
+def last_active(job: dict) -> datetime:
+    """보관 정리 기준: 올린 시각과 다시 만든 시각(touched_at — 사이트가 업그레이드·결합 때 씀) 중 늦은 쪽."""
+    try:
+        touched = datetime.strptime(job.get("touched_at") or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return created(job)
+    return max(created(job), touched)
+
+
 def cleanup(root: Path) -> None:
     limit = datetime.now(timezone.utc) - RETENTION
     for d in root.iterdir():
         job = read_json(d / "job.json") if d.is_dir() else None
-        if job is not None and created(job) < limit:
+        if job is not None and last_active(job) < limit:
             shutil.rmtree(d, ignore_errors=True)
             log.info("보관기간 만료 삭제 %s", d.name)
 
