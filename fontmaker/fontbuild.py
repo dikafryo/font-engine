@@ -158,12 +158,12 @@ def build(glyphs: list[GlyphSrc], m: Metrics, family: str, uid: str, out_otf: Pa
     fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT)
     names = names or {}
     fb.setupNameTable(
-        {"familyName": {"en": family, "ko": family}, "styleName": "Regular", "uniqueFontIdentifier": f"font.sw4u.kr:{uid}",
+        {"familyName": {"en": family, "ko": family}, "styleName": "Regular", "uniqueFontIdentifier": f"neis.me/v1/font:{uid}",
          "fullName": {"en": family, "ko": family}, "psName": psn, "version": "Version 1.000",
-         "manufacturer": "font.sw4u.kr", "description": "손글씨로 만든 폰트 (font.sw4u.kr)",
-         "copyright": names.get("copyright") or "© font.sw4u.kr. 만든 사람과 공동 저작권.",
-         "licenseDescription": names.get("license_text") or "저작권은 만든 사람과 font.sw4u.kr 이 공동으로 보유합니다.",
-         "licenseInfoURL": names.get("license_url") or "https://font.sw4u.kr/terms"},
+         "manufacturer": "neis.me", "description": "손글씨로 만든 폰트 (neis.me/v1/font)",
+         "copyright": names.get("copyright") or "© neis.me. 만든 사람과 공동 저작권.",
+         "licenseDescription": names.get("license_text") or "저작권은 만든 사람과 neis.me 가 공동으로 보유합니다.",
+         "licenseInfoURL": names.get("license_url") or "https://neis.me/v1/font/terms"},
         mac=False,
     )
     fb.setupOS2(sTypoAscender=ASCENT, sTypoDescender=DESCENT, sTypoLineGap=200,

@@ -2,7 +2,7 @@
 
 사용: python -m fontmaker.worker <jobs 폴더>
 
-작업 폴더 규약 (사이트 sw4u/font 와 공유):
+작업 폴더 규약 (사이트 neisme/v1/font 와 공유, 2026-10-12 sw4u/font 에서 옮김):
   <jobs>/<id>/job.json     사이트가 씀  {"id", "font_name", "created_at"(ISO8601 UTC), "touched_at"(다시 만든 시각, 선택), "files": ["input/1.jpg", …],
                                          "copyright", "license_text", "license_url"(선택 — 폰트 name 테이블에 그대로 기록)}
   <jobs>/<id>/input/…      사이트가 씀  업로드 원본

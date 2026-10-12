@@ -59,7 +59,7 @@ def draw_frame(c: Canvas, page: L.Page, kind: int) -> None:
     c.setFont(FONT, 8)
     c.setFillColor(LABEL)
     label = f"{L.VERSION} 추가" if kind == L.ADDON_KIND else L.VERSION
-    c.drawRightString(190 * mm, y(17), f"font.sw4u.kr · {label} · {page.number}/{len(L.pages(kind))} 쪽")
+    c.drawRightString(190 * mm, y(17), f"neis.me/v1/font · {label} · {page.number}/{len(L.pages(kind))} 쪽")
 
 
 def draw_box(c: Canvas, cell: L.Cell) -> None:

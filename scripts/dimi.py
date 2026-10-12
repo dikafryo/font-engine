@@ -399,9 +399,9 @@ def build(out_otf: Path, family: str, uid: str, names: dict[str, str]) -> dict[s
     fb.setupHorizontalMetrics(metrics)
     fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT)
     fb.setupNameTable(
-        {"familyName": {"en": family, "ko": family}, "styleName": "Regular", "uniqueFontIdentifier": f"font.sw4u.kr:{uid}",
+        {"familyName": {"en": family, "ko": family}, "styleName": "Regular", "uniqueFontIdentifier": f"neis.me/v1/font:{uid}",
          "fullName": {"en": family, "ko": family}, "psName": psn, "version": "Version 1.000",
-         "manufacturer": "font.sw4u.kr", "description": "디지털·미래 느낌의 둥근 고딕 — 기하학적 자모 뼈대로 그린 폰트 (font.sw4u.kr)",
+         "manufacturer": "neis.me", "description": "디지털·미래 느낌의 둥근 고딕 — 기하학적 자모 뼈대로 그린 폰트 (neis.me/v1/font)",
          "copyright": names["copyright"], "licenseDescription": names["license_text"], "licenseInfoURL": names["license_url"]},
         mac=False,
     )
@@ -427,7 +427,7 @@ def sample(otf: Path, out: Path) -> None:
     d = ImageDraw.Draw(img)
     for i, line in enumerate(SAMPLE):
         d.text((30, 25 + i * 90), line, font=font, fill=(20, 20, 30))
-    small = "작은 크기에서도 읽기 편한지 봅니다. 한글 11,172자와 영문·숫자가 모두 들어 있어요. 2026년 10월 11일, font.sw4u.kr"
+    small = "작은 크기에서도 읽기 편한지 봅니다. 한글 11,172자와 영문·숫자가 모두 들어 있어요. 2026년 10월 11일, neis.me"
     y = 90 * len(SAMPLE) + 50
     for size in (28, 20, 14):
         d.text((30, y), small, font=ImageFont.truetype(str(otf), size), fill=(20, 20, 30))
@@ -444,9 +444,9 @@ def main() -> None:
     ap.add_argument("--author", default="Claude")
     ap.add_argument("--sample", type=Path)
     a = ap.parse_args()
-    names = {"copyright": f"© 2026 {a.author} & font.sw4u.kr. 공동 저작권.",
-             "license_text": "저작권은 만든 사람과 font.sw4u.kr 이 공동으로 보유합니다. 누구나 상업적 이용을 포함해 자유롭게 사용·배포할 수 있습니다. 폰트 파일 자체의 판매는 금지합니다.",
-             "license_url": "https://font.sw4u.kr/terms#public_commercial"}
+    names = {"copyright": f"© 2026 {a.author} & neis.me. 공동 저작권.",
+             "license_text": "저작권은 만든 사람과 neis.me 가 공동으로 보유합니다. 누구나 상업적 이용을 포함해 자유롭게 사용·배포할 수 있습니다. 폰트 파일 자체의 판매는 금지합니다.",
+             "license_url": "https://neis.me/v1/font/terms#public_commercial"}
     otf = a.out / "font.otf"
     count = build(otf, a.family, a.uid, names)
     to_woff2(otf, a.out / "font.woff2")

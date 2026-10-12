@@ -1,6 +1,6 @@
 # fontmaker — 손글씨 양식 스캔 → 한글 폰트
 
-font.sw4u.kr(`sw4u/font`) 의 폰트 엔진. 웹 서빙 대상 아님. 사이트와는 작업 폴더 규약으로만 연결된다(`sw4u/font/CLAUDE.md`).
+neis.me/v1/font(코드 `neisme/v1/font`, 2026-10-12 font.sw4u.kr·`sw4u/font` 에서 옮김) 의 폰트 엔진. 웹 서빙 대상 아님. 사이트와는 작업 폴더 규약으로만 연결된다(`neisme/v1/font/CLAUDE.md`).
 
 ## 저장소 (GitHub, 비공개)
 - 엔진(여기): https://github.com/dikafryo/font-engine
@@ -73,7 +73,7 @@ venv: reportlab, fonttools, brotli, opencv-python-headless, numpy, potracer, pym
 ## 2026-10-10 저녁 — 폰트 메타데이터
 사이트가 `job.json` 에 `copyright`·`license_text`·`license_url` 을 넣어 주면 워커가 그대로 name 테이블
 ID 0(copyright)·13(licenseDescription)·14(licenseInfoURL)에 기록한다(`fontbuild.build(..., names)`). 없으면 기본 문구.
-문구의 기준은 사이트 `sw4u/font/src/License.php` 한 곳이며 엔진은 라이선스 종류를 모른다.
+문구의 기준은 사이트 `neisme/v1/font/src/License.php` 한 곳이며 엔진은 라이선스 종류를 모른다.
 
 ## 글자 편집 덮어쓰기 (2026-10-11)
 job.json 의 `"glyphs": {"가": "glyphs/AC00.png"}` 가 있으면 `pipeline.run(..., glyphs=)` 이 그 PNG(흰 바탕·검은 획, 정사각)를 칸 크기로 줄여 마스크로 쓴다.

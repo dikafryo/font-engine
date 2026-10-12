@@ -120,7 +120,7 @@ def align(img: np.ndarray, source: str) -> PageImage:
         code = read_code(page)
         if code is not None:
             return PageImage(code[1], page, source, code[0])
-    raise ScanError("쪽 코드(아래 가운데 작은 네모)를 읽지 못했습니다 — font.sw4u.kr 양식이 맞는지 확인해 주세요")
+    raise ScanError("쪽 코드(아래 가운데 작은 네모)를 읽지 못했습니다 — neis.me 손글씨 폰트 양식이 맞는지 확인해 주세요")
 
 
 def extract_cells(page: PageImage) -> list[CellInk]:
