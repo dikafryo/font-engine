@@ -9,7 +9,7 @@ from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.t2CharStringPen import T2CharStringPen
 from fontTools.ttLib import TTFont
 
-from .vector import Outline, Point, affine, bounds
+from .vector import Outline, Point, affine, bounds, scale_about
 
 UPM = 1000
 ASCENT, DESCENT = 880, -120
@@ -41,6 +41,66 @@ def place_hangul(outline: Outline, m: Metrics) -> Outline:
     ty = HANGUL_MID + (by - keep) * m.scale
     tx = m.hangul_adv / 2 - (b.x0 + b.x1) / 2 * m.scale
     return affine(outline, m.scale, -m.scale, tx, ty)
+
+
+CAPS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")  # 대문자선까지
+ASCENDERS = set("bdfhklt")  # 대문자선까지 (t 는 조금 낮게)
+XHEIGHT = set("acemnorsuvwxzi")  # x 높이까지 (i 는 몸통 기준, 점은 따라 움직인다)
+DESCENDERS = set("gjpqy")  # 전체 높이는 어센더만큼, 몸통 꼭대기를 x 높이에 두어 꼬리가 기준선 아래로 내려간다
+SHORTER = {"t": 0.85}  # 어센더 무리 안에서 낮게 쓰는 글자
+EVEN_RANGE = (0.6, 1.6)  # 한 글자를 키우거나 줄이는 한계 (측정이 어긋난 글자가 폭주하지 않게)
+
+
+def _main_top(outline: Outline) -> float:
+    """몸통(경계 상자가 가장 큰 윤곽)의 꼭대기 y. i·j 의 점, 떨어진 조각은 뺀다."""
+    best, top = -1.0, 0.0
+    for c in outline:
+        b = bounds([c])
+        if b and b.w * b.h > best:
+            best, top = b.w * b.h, b.y0
+    return top
+
+
+def even_latin_heights(latin: dict[str, Outline], baseline_px: float) -> dict[str, Outline]:
+    """영문·숫자 높이를 고르게: 같은 무리(대문자·숫자·어센더 / x 높이·디센더)는 그 무리의 중앙값 높이로 기준선을 축으로
+    확대·축소한다. 글쓴이의 비율(대문자 대 x 높이)은 중앙값이 그대로 지키고, 글자마다 들쭉날쭉한 것만 고른다.
+    기호·문장부호는 손대지 않는다. 기준선에서 뜬 글자는 바닥을 기준선에 붙인다(디센더는 꼬리가 바닥이라 제외)."""
+    heights: dict[str, float] = {}  # 글자 → 기준선 위 높이 (픽셀). 무리 중앙값(목표)을 재는 데만 쓴다
+    for ch, o in latin.items():
+        if ch in CAPS or ch in ASCENDERS:
+            heights[ch] = baseline_px - bounds(o).y0
+        elif ch in XHEIGHT:
+            heights[ch] = baseline_px - _main_top(o)
+    cap = _median([h for c, h in heights.items() if c in CAPS or c in ASCENDERS])
+    xh = _median([h for c, h in heights.items() if c in XHEIGHT])
+    out = {}
+    for ch, o in latin.items():
+        b = bounds(o)
+        if ch in DESCENDERS and cap and xh:
+            # 많은 분이 p·q·g·y 를 기준선 아래로 내리지 않고 칸 위쪽에 통째로 쓴다. 전체 높이를 어센더 높이로 맞춘 뒤
+            # 몸통 꼭대기를 x 높이에 두면 꼬리가 기준선 아래로 내려간다
+            k = _clamp(cap / max(b.h, 1))
+            o = scale_about(o, k, k, b.x0, b.y0)
+            out[ch] = affine(o, 1, 1, 0, baseline_px - xh - _main_top(o))
+            continue
+        target = (cap * SHORTER.get(ch, 1.0)) if (ch in CAPS or ch in ASCENDERS) else (xh if ch in XHEIGHT else None)
+        if not target or not b:
+            out[ch] = o  # 기호·문장부호
+            continue
+        o = affine(o, 1, 1, 0, baseline_px - b.y1)  # 바닥을 기준선에
+        h = baseline_px - (bounds(o).y0 if ch in CAPS or ch in ASCENDERS else _main_top(o))
+        k = _clamp(target / max(h, 1))
+        out[ch] = scale_about(o, k, k, bounds(o).x0, baseline_px)
+    return out
+
+
+def _median(xs: list[float]) -> float:
+    xs = sorted(x for x in xs if x > 0)
+    return xs[len(xs) // 2] if xs else 0.0
+
+
+def _clamp(k: float) -> float:
+    return min(max(k, EVEN_RANGE[0]), EVEN_RANGE[1])
 
 
 def place_latin(outline: Outline, m: Metrics) -> tuple[Outline, int]:

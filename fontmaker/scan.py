@@ -161,9 +161,14 @@ def drop_printed_lines(mask: np.ndarray, kind: str, inset: float) -> np.ndarray:
     run = max(3, int(0.25 * size))
     m = mask.astype(np.uint8)
     rows = [(0, band), (size - band, size)]
+    frag_rows = list(rows)
     if kind == "latin":
+        # 인쇄·스캔 오차로 기준선이 1.5mm 넘게 어긋난 스캔이 있다(흑백 앱 스캔 실측 +1.5mm). 긴 줄 지우기는 ±1.6mm 로 두고
+        # (넓히면 기준선에 붙여 쓴 L·E 의 밑획이 줄로 지워졌다), 떨어져 남은 납작한 조각만 ±2.6mm 안에서 지운다
         base = int((L.BOX * L.LATIN_BASELINE - inset) * PX_PER_MM)
         rows.append((base - band, base + band))
+        wide = int(2.6 * PX_PER_MM)
+        frag_rows.append((base - wide, base + wide))
     out = mask.copy()
     for horizontal, spans in ((True, rows), (False, [(0, band), (size - band, size)])):
         kernel = np.ones((1, run) if horizontal else (run, 1), np.uint8)
@@ -177,12 +182,14 @@ def drop_printed_lines(mask: np.ndarray, kind: str, inset: float) -> np.ndarray:
     n, labels, stats, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), connectivity=8)
     thin = int(0.6 * PX_PER_MM)
     for i in range(1, n):
-        x, y, w, h, _ = stats[i]
+        x, y, w, h, area = stats[i]
         flat = h <= thin and w >= 2 * h
         tall = w <= thin and h >= 2 * w
-        in_row = any(lo <= y and y + h <= hi for lo, hi in rows)
+        in_row = any(lo <= y and y + h <= hi for lo, hi in frag_rows)
         in_col = x + w <= band or x >= size - band
-        if (flat and in_row) or (tall and in_col):
+        in_edge_row = y + h <= band or y >= size - band
+        corner = in_col and in_edge_row and area < PX_PER_MM ** 2  # 칸 모서리에 남은 테두리 꼭짓점 조각
+        if (flat and in_row) or (tall and in_col) or corner:
             out[labels == i] = False
     return out
 

@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from . import layout as L
 from .compose import TYPES, Composer, Library
-from .fontbuild import GlyphSrc, Metrics, build, to_woff2
+from .fontbuild import GlyphSrc, Metrics, build, even_latin_heights, to_woff2
 from .hangul import CHO, JONG, JUNG, all_syllables, decompose, segment
 from .scan import PX_PER_MM, PageImage, ScanError, align, extract_cells, load_images
 from .vector import Bounds, Outline, bounds, fit, trace
@@ -141,11 +141,12 @@ def run(inputs: list[Path], family: str, uid: str, out: Path, progress: Progress
         else:
             report.not_made += 1
     glyphs += compat_jamo(lib, cell_px)
+    metrics = make_metrics(list(direct.values()), cell_px)
+    latin = even_latin_heights(latin, metrics.baseline_px)  # 대문자·숫자·소문자 높이를 무리별로 고르게
     glyphs += [GlyphSrc(ch, o, "latin") for ch, o in latin.items()]
     report.direct, report.latin = len(direct), len(latin)
 
     progress("build", 85)
-    metrics = make_metrics(list(direct.values()), cell_px)
     otf = build(glyphs, metrics, family, uid, out / "font.otf", names)
     to_woff2(otf, out / "font.woff2")
     preview(otf, out / "preview.png")
